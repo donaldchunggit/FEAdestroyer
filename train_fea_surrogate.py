@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-CSV_PATH = "fea_realistic_40k.csv"  # put the csv next to this file
+CSV_PATH = "fea_realistic_40k.csv"  # put the csv next to this files
 
 
 def sincos_degrees(angle_deg: np.ndarray) -> np.ndarray:
