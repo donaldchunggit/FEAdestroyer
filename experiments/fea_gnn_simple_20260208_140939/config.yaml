@@ -1,0 +1,23 @@
+data:
+  batch_size: 2
+  max_train_samples: 80
+  max_val_samples: 20
+  train_dir: dataset/train
+  val_dir: dataset/val
+device: cpu
+experiment_name: fea_gnn_simple
+loss:
+  boundary_weight: 10.0
+  data_weight: 1.0
+  physics_weight: 1.0
+model:
+  dropout: 0.1
+  hidden_dim: 128
+  num_layers: 3
+training:
+  epochs: 10
+  learning_rate: 0.001
+  patience: 5
+  weight_decay: 0.0001
+wandb:
+  enabled: false
