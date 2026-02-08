@@ -1,0 +1,38 @@
+# configs/engineering_config.yaml
+experiment_name: "fea_destroyer_engineering"
+seed: 42
+device: "cpu"
+
+# Data
+data:
+  train_dir: "dataset/train"
+  val_dir: "dataset/val"
+  max_train_samples: 200
+  max_val_samples: 40
+  batch_size: 4
+
+# Model
+model:
+  hidden_dim: 256
+  num_layers: 4
+
+# Physics
+physics:
+  yield_stress: 250e6
+  buckling_safety: 1.5
+  max_deflection_ratio: 0.00278  # L/360
+
+# Training
+training:
+  epochs: 50
+  learning_rate: 0.0005
+  weight_decay: 1e-5
+  gradient_clip: 0.5
+  checkpoint_freq: 10
+  patience: 15
+
+# Validation
+validation:
+  min_safety_factor: 1.5
+  max_stress_ratio: 0.9
+  engineering_codes: ["ASME", "AISC"]
