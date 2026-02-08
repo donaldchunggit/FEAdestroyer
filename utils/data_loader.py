@@ -1,5 +1,13 @@
 """
-Data loading utilities for NPZ to PyG conversion.
+Data loading utilities for NPZ -> PyTorch Geometric Data.
+
+Fixes & upgrades:
+- Ensures stress_true is always [N,1] and u_true is always [N,3] (batch-safe)
+- Creates explicit fixed_mask/free_mask (so training masking is correct)
+- Injects global conditioning into node features:
+    force_dir(3), log10(|F|+1), log10(E), nu  -> broadcast to all nodes
+- Keeps edge_attr at 6 dims for compatibility with your EngineeringGNN:
+    [edge_length, dx_norm, dy_norm, dz_norm, E, nu]
 """
 
 import os
@@ -10,186 +18,231 @@ import torch
 from torch_geometric.data import Data, Dataset
 from tqdm import tqdm
 
+
+# -----------------------------
+# Utility helpers
+# -----------------------------
+def _as_float32(x) -> np.ndarray:
+    return np.asarray(x, dtype=np.float32)
+
+
+def _as_long(x) -> np.ndarray:
+    return np.asarray(x, dtype=np.int64)
+
+
+def _ensure_2d_col(x: np.ndarray) -> np.ndarray:
+    """Ensure shape [N,1] for per-node scalar arrays."""
+    x = np.asarray(x)
+    if x.ndim == 1:
+        return x[:, None]
+    if x.ndim == 2 and x.shape[1] == 1:
+        return x
+    # If weird shape, try flatten then col
+    return x.reshape(-1, 1)
+
+
+def _global_features(force_vec: np.ndarray, material_params: np.ndarray) -> np.ndarray:
+    """
+    Build global conditioning vector g of shape (6,):
+      [Fx_dir, Fy_dir, Fz_dir, log10(|F|+1), log10(E), nu]
+    """
+    force_vec = _as_float32(force_vec).reshape(3,)
+    E = float(_as_float32(material_params)[0])
+    nu = float(_as_float32(material_params)[1])
+
+    Fmag = float(np.linalg.norm(force_vec) + 1e-8)
+    f_dir = force_vec / Fmag  # (3,)
+
+    logF = np.log10(Fmag + 1.0).astype(np.float32)
+    logE = np.log10(E + 1e-12).astype(np.float32)
+
+    g = np.array([f_dir[0], f_dir[1], f_dir[2], logF, logE, nu], dtype=np.float32)
+    return g
+
+
+def _build_edges_from_tets(tets: np.ndarray) -> np.ndarray:
+    """
+    tets: [T,4] int
+    returns directed edge_index as np array [2, E]
+    """
+    # Each tet has 6 undirected edges; we add both directions.
+    # Use python set to dedupe.
+    edges = set()
+    for a, b, c, d in tets:
+        pairs = [(a, b), (a, c), (a, d), (b, c), (b, d), (c, d)]
+        for i, j in pairs:
+            edges.add((int(i), int(j)))
+            edges.add((int(j), int(i)))
+
+    if len(edges) == 0:
+        return np.zeros((2, 0), dtype=np.int64)
+
+    edge_index = np.array(list(edges), dtype=np.int64).T  # [2, E]
+    return edge_index
+
+
+# -----------------------------
+# Main loader
+# -----------------------------
 def load_single_npz(npz_path: str) -> Data:
     """
     Load a single NPZ file and convert to PyG Data object.
-    
-    Expected keys (from your physics_engine.py):
-        node_coords: [N, 3] - nodal coordinates
-        connectivity: [E, 4] - tetrahedron connectivity
-        input_force: [3,] - applied force vector
-        material_params: [2,] - [E, nu]
-        node_stresses: [N, 1] - von Mises stress
-        node_disp: [N, 3] - nodal displacements
+
+    Expected keys:
+        node_coords:      [N, 3]
+        connectivity:     [T, 4]  tetrahedra
+        input_force:      [3,]
+        material_params:  [2,]    [E (Pa), nu]
+        node_stresses:    [N] or [N,1]
+        node_disp:        [N,3]
     """
-    try:
-        data = np.load(npz_path, allow_pickle=True)
-        
-        # Node coordinates
-        pos = torch.tensor(data['node_coords'], dtype=torch.float32)
-        num_nodes = pos.shape[0]
-        
-        # Node features: [x, y, z, is_boundary, distance_to_root]
-        z_min = pos[:, 2].min()
-        z_max = pos[:, 2].max()
-        
-        # Boundary flag (clamped at z_min)
-        boundary = (pos[:, 2] < z_min + 0.1).float().unsqueeze(1)
-        
-        # Normalized distance from clamped end
-        dist_to_root = (pos[:, 2] - z_min) / (z_max - z_min + 1e-8)
-        dist_to_root = dist_to_root.unsqueeze(1)
-        
-        # Node features
-        x = torch.cat([pos, boundary, dist_to_root], dim=1)  # [N, 5]
-        
-        # Create edges from tetrahedral connectivity
-        connectivity = torch.tensor(data['connectivity'], dtype=torch.long)
-        
-        # Build edge list (undirected, both directions)
-        edges = []
-        for tet in connectivity:
-            nodes = tet.tolist()
-            # Create all 6 edges per tetrahedron
-            edges.extend([(nodes[0], nodes[1]), (nodes[1], nodes[0])])
-            edges.extend([(nodes[0], nodes[2]), (nodes[2], nodes[0])])
-            edges.extend([(nodes[0], nodes[3]), (nodes[3], nodes[0])])
-            edges.extend([(nodes[1], nodes[2]), (nodes[2], nodes[1])])
-            edges.extend([(nodes[1], nodes[3]), (nodes[3], nodes[1])])
-            edges.extend([(nodes[2], nodes[3]), (nodes[3], nodes[2])])
-        
-        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-        
-        # Remove duplicate edges (optional, for efficiency)
-        edge_index = torch.unique(edge_index, dim=1)
-        
-        # Edge features: [distance, dx, dy, dz, material_E, material_nu]
-        src_pos = pos[edge_index[0]]
-        dst_pos = pos[edge_index[1]]
-        edge_vec = dst_pos - src_pos
-        edge_length = torch.norm(edge_vec, dim=1, keepdim=True)
-        
-        # Material properties
-        E = torch.tensor(data['material_params'][0], dtype=torch.float32)
-        nu = torch.tensor(data['material_params'][1], dtype=torch.float32)
-        
-        edge_attr = torch.cat([
-            edge_length,  # [E, 1]
-            edge_vec / (edge_length + 1e-8),  # [E, 3] normalized direction
-            torch.ones_like(edge_length) * E,  # [E, 1]
-            torch.ones_like(edge_length) * nu  # [E, 1]
-        ], dim=1)  # [E, 6]
-        
-        # External forces (distributed to tip nodes)
-        force_vector = torch.tensor(data['input_force'], dtype=torch.float32)
-        tip_mask = (pos[:, 2] > z_max - 0.1).float()
-        num_tip_nodes = tip_mask.sum().item()
-        
-        if num_tip_nodes > 0:
-            force_per_node = force_vector / num_tip_nodes
-            f = torch.zeros_like(pos)
-            f[tip_mask.bool()] = force_per_node
-        else:
-            f = torch.zeros_like(pos)
-        
-        # Boundary conditions (3 DOF per node)
-        bc = torch.zeros(num_nodes, 3, dtype=torch.float32)
-        bc[boundary.squeeze().bool(), :] = 1.0  # Fixed at clamped end
-        
-        # Ground truth labels
-        u_true = torch.tensor(data['node_disp'], dtype=torch.float32)
-        stress_true = torch.tensor(data['node_stresses'], dtype=torch.float32)
-        
-        # Additional info
-        material_params = torch.tensor([E, nu], dtype=torch.float32)
-        force_vector_tensor = torch.tensor(force_vector, dtype=torch.float32)
-        
-        return Data(
-            x=x,  # Node features [N, 5]
-            pos=pos,  # Coordinates [N, 3]
-            edge_index=edge_index,  # [2, E]
-            edge_attr=edge_attr,  # [E, 6]
-            f=f,  # Nodal forces [N, 3]
-            bc=bc,  # Boundary conditions [N, 3]
-            u_true=u_true,  # Displacement labels [N, 3]
-            stress_true=stress_true,  # Stress labels [N, 1]
-            tetra_connectivity=connectivity,  # [E_tet, 4]
-            material_params=material_params,  # [2]
-            force_vector=force_vector_tensor,  # [3]
-            num_nodes=num_nodes
-        )
-        
-    except Exception as e:
-        print(f"Error loading {npz_path}: {e}")
-        raise
+    data = np.load(npz_path, allow_pickle=True)
+
+    # --- Core arrays
+    coords = _as_float32(data["node_coords"])
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError(f"{npz_path}: node_coords must be [N,3], got {coords.shape}")
+    N = coords.shape[0]
+
+    tets = _as_long(data["connectivity"])
+    if tets.ndim != 2 or tets.shape[1] != 4:
+        raise ValueError(f"{npz_path}: connectivity must be [T,4], got {tets.shape}")
+
+    force_vec = _as_float32(data["input_force"]).reshape(3,)
+    mat = _as_float32(data["material_params"]).reshape(2,)
+    E = float(mat[0])
+    nu = float(mat[1])
+
+    u_true = _as_float32(data["node_disp"])
+    if u_true.shape != (N, 3):
+        raise ValueError(f"{npz_path}: node_disp must be [N,3], got {u_true.shape}")
+
+    stress_true = _as_float32(data["node_stresses"])
+    stress_true = _ensure_2d_col(stress_true)  # [N,1]
+    if stress_true.shape[0] != N:
+        raise ValueError(f"{npz_path}: node_stresses must have N rows, got {stress_true.shape}")
+
+    # --- Fixed boundary mask (cantilever clamp at z_min)
+    z = coords[:, 2]
+    z_min = float(z.min())
+    z_max = float(z.max())
+
+    # This threshold is in your mesh units; keep consistent with your solver generation.
+    fixed = (z < (z_min + 0.1)).astype(np.float32)  # [N]
+    fixed_mask = _ensure_2d_col(fixed)              # [N,1]
+    free_mask = 1.0 - fixed_mask                    # [N,1]
+
+    # --- Tip mask / nodal forces (distributed)
+    tip = (z > (z_max - 0.1)).astype(np.float32)    # [N]
+    tip_count = float(tip.sum())
+    f_nodes = np.zeros((N, 3), dtype=np.float32)
+    if tip_count > 0:
+        f_nodes[tip.astype(bool)] = force_vec / tip_count
+
+    # --- Boundary condition tensor (3 dof)
+    bc = np.zeros((N, 3), dtype=np.float32)
+    bc[fixed.astype(bool), :] = 1.0
+
+    # --- Global conditioning features (broadcast to nodes)
+    g = _global_features(force_vec, mat)            # (6,)
+    g_node = np.tile(g[None, :], (N, 1)).astype(np.float32)  # [N,6]
+
+    # --- Distance-to-root feature (useful)
+    dist_to_root = ((z - z_min) / (z_max - z_min + 1e-8)).astype(np.float32)
+    dist_to_root = _ensure_2d_col(dist_to_root)     # [N,1]
+
+    # --- Tip flag (free end)
+    tip_flag = (z > (z_max - 0.1)).astype(np.float32)
+    tip_flag = _ensure_2d_col(tip_flag)  # [N,1]
+
+    # --- Node features
+    # Keep your original useful parts AND add conditioning:
+    # [x,y,z, fixed_mask, dist_to_root, force_dir(3), logF, logE, nu]
+    x = np.concatenate(
+        [
+            coords,                 # 3
+            fixed_mask,             # 1
+            dist_to_root,           # 1
+            tip_flag,              # 1
+            g_node,                 # 6
+        ],
+        axis=1,
+    ).astype(np.float32)            # total 3+1+1+1+6 = 12 dims
+
+    # --- Edges
+    edge_index = _build_edges_from_tets(tets)       # [2,E]
+    edge_index_t = torch.from_numpy(edge_index).long()
+
+    pos_t = torch.from_numpy(coords).float()
+
+    # Edge attr: [length, dx_norm, dy_norm, dz_norm, E, nu]
+    if edge_index.shape[1] == 0:
+        edge_attr = torch.zeros((0, 6), dtype=torch.float32)
+    else:
+        src = pos_t[edge_index_t[0]]
+        dst = pos_t[edge_index_t[1]]
+        edge_vec = dst - src
+        edge_len = torch.norm(edge_vec, dim=1, keepdim=True)  # [E,1]
+        edge_dir = edge_vec / (edge_len + 1e-8)               # [E,3]
+        E_col = torch.full_like(edge_len, float(E))
+        nu_col = torch.full_like(edge_len, float(nu))
+        edge_attr = torch.cat([edge_len, edge_dir, E_col, nu_col], dim=1)  # [E,6]
+
+    # --- Build Data
+    pyg = Data(
+        x=torch.from_numpy(x).float(),                    # [N,11]
+        pos=pos_t,                                        # [N,3]
+        edge_index=edge_index_t,                           # [2,E]
+        edge_attr=edge_attr,                               # [E,6]
+
+        # Extra fields used by training / debugging:
+        u_true=torch.from_numpy(u_true).float(),           # [N,3]
+        stress_true=torch.from_numpy(stress_true).float(), # [N,1]
+
+        fixed_mask=torch.from_numpy(fixed_mask).float(),   # [N,1]
+        free_mask=torch.from_numpy(free_mask).float(),     # [N,1]
+        node_tip=torch.from_numpy(tip_flag).float(),      # [N,1]
+
+        f=torch.from_numpy(f_nodes).float(),               # [N,3]
+        bc=torch.from_numpy(bc).float(),                   # [N,3]
+
+        tetra_connectivity=torch.from_numpy(tets).long(),  # [T,4]
+        material_params=torch.from_numpy(mat).float(),     # [2]
+        force_vector=torch.from_numpy(force_vec).float(),  # [3]
+        num_nodes=int(N),
+    )
+
+    return pyg
+
 
 class NPZDataset(Dataset):
-    """PyG Dataset for NPZ files"""
+    """PyG Dataset for NPZ files."""
     def __init__(self, npz_dir: str, max_samples: Optional[int] = None):
         self.npz_files = sorted(glob.glob(os.path.join(npz_dir, "*.npz")))
-        
         if max_samples is not None:
             self.npz_files = self.npz_files[:max_samples]
-        
         super().__init__()
-    
+
     def len(self):
         return len(self.npz_files)
-    
+
     def get(self, idx):
         return load_single_npz(self.npz_files[idx])
 
+
 def load_npz_dataset(npz_dir: str, max_samples: Optional[int] = None) -> List[Data]:
-    """Load all NPZ files in directory"""
+    """Load all NPZ files in a directory into a list of Data objects."""
     npz_files = sorted(glob.glob(os.path.join(npz_dir, "*.npz")))
-    
     if max_samples is not None:
         npz_files = npz_files[:max_samples]
-    
+
     print(f"Loading {len(npz_files)} samples from {npz_dir}")
-    
-    data_list = []
-    for npz_file in tqdm(npz_files, desc="Loading data"):
+
+    out: List[Data] = []
+    for p in tqdm(npz_files, desc="Loading data"):
         try:
-            data = load_single_npz(npz_file)
-            data_list.append(data)
+            out.append(load_single_npz(p))
         except Exception as e:
-            print(f"Skipping {npz_file}: {e}")
-    
-    return data_list
+            print(f"Skipping {p}: {e}")
 
-def split_dataset(data_list, train_ratio=0.8, val_ratio=0.2):
-    """Split dataset into train and validation"""
-    assert train_ratio + val_ratio == 1.0, "Ratios must sum to 1.0"
-    
-    num_samples = len(data_list)
-    num_train = int(num_samples * train_ratio)
-    
-    # Shuffle indices
-    indices = np.random.permutation(num_samples)
-    
-    train_indices = indices[:num_train]
-    val_indices = indices[num_train:]
-    
-    train_data = [data_list[i] for i in train_indices]
-    val_data = [data_list[i] for i in val_indices]
-    
-    return train_data, val_data
-
-def create_data_loaders(train_data, val_data, batch_size=4):
-    """Create data loaders"""
-    train_loader = DataLoader(
-        train_data,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0
-    )
-    
-    val_loader = DataLoader(
-        val_data,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0
-    )
-    
-    return train_loader, val_loader
+    return out

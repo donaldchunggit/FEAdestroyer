@@ -97,34 +97,59 @@ def solve_fake_fea(nodes, elements, E, nu, force_vector):
         # Add some random variation
         displacements[i] += np.random.randn(3) * 0.001
     
-    # Generate stresses (higher near clamp, tip)
+    # **FIXED: Generate realistic stress values in 100-200 MPa range**
     stresses = np.zeros((num_nodes, 1), dtype=np.float32)
+    
+    # Base stress range (in MPa)
+    min_stress_mpa = 80
+    max_stress_mpa = 220
+    
+    # Scale factor based on Young's modulus (steel is reference)
+    E_scale = E / 210000  # 210 GPa is steel
     
     for i in range(num_nodes):
         z = nodes[i, 2]
         t = (z - clamped_z) / (tip_z - clamped_z + 1e-8)
         
-        # Stress is higher near clamp (t=0) for cantilever
-        base_stress = 100 * E / 210000  # Scale with Young's modulus
+        # Stress is highest near clamp (t=0) and decreases toward tip
+        # Stress formula for cantilever beam: σ = (M*y)/I
+        # Simplified: stress = base * (1 - 0.7*t)
+        base_stress = np.random.uniform(min_stress_mpa, max_stress_mpa)
         
-        # Stress distribution: higher near clamp, lower at tip
-        stress_value = base_stress * (1 - 0.8 * t)
+        # Position-dependent stress (higher near clamp)
+        position_factor = 1.0 - 0.7 * t
         
-        # Add element-based variation
-        element_stress = 0
-        element_count = 0
+        # Scale by material stiffness
+        material_factor = E_scale
+        
+        # Stress from force magnitude
+        force_magnitude = np.linalg.norm(force_vector)
+        force_factor = force_magnitude / 1000  # Normalize
+        
+        # Element connectivity factor
+        connectivity_factor = 1.0
+        connected_elements = 0
         for elem in elements:
             if i in elem:
-                # Random stress contribution from each element
-                element_stress += np.random.uniform(0.8, 1.2)
-                element_count += 1
+                connectivity_factor *= np.random.uniform(0.9, 1.1)
+                connected_elements += 1
         
-        if element_count > 0:
-            stress_value *= element_stress / element_count
+        if connected_elements > 0:
+            connectivity_factor = connectivity_factor ** (1.0 / connected_elements)
         
-        # Add some noise
-        stress_value *= np.random.uniform(0.9, 1.1)
-        stresses[i] = max(0.1, stress_value)  # Ensure positive
+        # Calculate final stress in MPa
+        stress_mpa = base_stress * position_factor * material_factor * force_factor * connectivity_factor
+        
+        # Convert to Pa (1 MPa = 1e6 Pa)
+        stress_pa = stress_mpa * 1e6
+        
+        # Add some randomness
+        stress_pa *= np.random.uniform(0.95, 1.05)
+        
+        # Ensure stress is within reasonable bounds
+        stress_pa = max(10e6, min(400e6, stress_pa))  # Between 10 MPa and 400 MPa
+        
+        stresses[i] = stress_pa
     
     return displacements, stresses
 
@@ -187,6 +212,11 @@ while samples_generated < TARGET_SAMPLES:
     # Generate displacements and stresses
     disp, stress = solve_fake_fea(nodes, elements, mat["E"], mat["nu"], force)
     
+    # Calculate statistics for debugging
+    max_stress_mpa = stress.max() / 1e6
+    min_stress_mpa = stress.min() / 1e6
+    avg_stress_mpa = stress.mean() / 1e6
+    
     # 4. Skip visualization for now
     # if samples_generated % VISUALIZE_EVERY == 0:
     #     print(f"Visualizing Sample {samples_generated}...")
@@ -206,12 +236,18 @@ while samples_generated < TARGET_SAMPLES:
         "force_magnitude": np.linalg.norm(force),
         "length": length,
         "width": width,
-        "height": height
+        "height": height,
+        "max_stress_mpa": max_stress_mpa,
+        "min_stress_mpa": min_stress_mpa,
+        "avg_stress_mpa": avg_stress_mpa,
+        "max_disp_mm": disp.max() * 1000  # Convert to mm
     })
     
     samples_generated += 1
     if samples_generated % 10 == 0:
         print(f"Progress: {samples_generated}/{TARGET_SAMPLES} samples complete.")
+        print(f"  Last sample - Stress: {avg_stress_mpa:.1f} MPa avg, {max_stress_mpa:.1f} MPa max")
+        print(f"  Last sample - Displacement: {disp.max() * 1000:.1f} mm max")
     
     # Safety check
     if attempts > TARGET_SAMPLES * 3:
@@ -223,8 +259,17 @@ if metadata_list:
     df = pd.DataFrame(metadata_list)
     df.to_csv("dataset/master_metadata.csv", index=False)
     
+    # Print statistics
     print(f"\nSuccess! {samples_generated} samples generated in 'dataset/' folder.")
-    print(f"Master metadata saved as 'dataset/master_metadata.csv'.")
+    print(f"Stress statistics:")
+    print(f"  Average stress: {df['avg_stress_mpa'].mean():.1f} MPa")
+    print(f"  Max stress: {df['max_stress_mpa'].max():.1f} MPa")
+    print(f"  Min stress: {df['min_stress_mpa'].min():.1f} MPa")
+    print(f"Displacement statistics:")
+    print(f"  Max displacement: {df['max_disp_mm'].max():.1f} mm")
+    print(f"  Average max displacement: {df['max_disp_mm'].mean():.1f} mm")
+    
+    print(f"\nMaster metadata saved as 'dataset/master_metadata.csv'.")
     
     # Create train/val split for GNN
     os.makedirs("dataset/train", exist_ok=True)
