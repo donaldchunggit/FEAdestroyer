@@ -26,17 +26,75 @@ except ImportError as e:
 
 from utils.data_loader import load_npz_dataset
 
+# ---------------------------------------------------------------------------
+# Device detection
+# ---------------------------------------------------------------------------
+import platform, subprocess
+
+def _get_cpu_name() -> str:
+    try:
+        if platform.system() == "Windows":
+            out = subprocess.check_output("wmic cpu get name", shell=True).decode()
+            return out.strip().splitlines()[-1].strip()
+        elif platform.system() == "Linux":
+            out = subprocess.check_output(
+                "grep -m1 'model name' /proc/cpuinfo", shell=True
+            ).decode()
+            return out.split(":", 1)[-1].strip()
+        elif platform.system() == "Darwin":
+            out = subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"]
+            ).decode()
+            return out.strip()
+    except Exception:
+        pass
+    return platform.processor()
+
+def detect_device() -> str:
+    """Return the best available device string and configure it."""
+    # 1. NVIDIA GPU (e.g. RTX 5070 Ti at home)
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"GPU detected: {name} ({vram:.1f} GB VRAM) — training on CUDA")
+        return "cuda"
+
+    # 2. Intel XPU via Intel Extension for PyTorch (optional dep)
+    try:
+        import intel_extension_for_pytorch as ipex  # noqa: F401
+        if torch.xpu.is_available():
+            print("Intel XPU detected — training on XPU")
+            return "xpu"
+    except ImportError:
+        pass
+
+    # 3. CPU — optimise thread count for Intel if present
+    cpu_name = _get_cpu_name()
+    n_threads = os.cpu_count() or 4
+    torch.set_num_threads(n_threads)
+    torch.set_num_interop_threads(max(1, n_threads // 2))
+    if "intel" in cpu_name.lower():
+        print(f"Intel CPU detected: {cpu_name}")
+        print(f"  Threads: {n_threads} intra-op, {max(1, n_threads // 2)} inter-op")
+        print("  Training on CPU (Intel-optimised thread count)")
+    else:
+        print(f"CPU detected: {cpu_name} — training on CPU")
+    return "cpu"
+
+_DEVICE = detect_device()
+
 class Config:
     EXPERIMENT_NAME = "advanced_professor_v1"
     SEED = 42
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    DEVICE = _DEVICE
     TRAIN_DIR = "generator_adv/advanced_dataset/train"
     VAL_DIR = "generator_adv/advanced_dataset/val"
     MAX_TRAIN_SAMPLES = None
     MAX_VAL_SAMPLES = None
     HIDDEN_DIM = 256
     NUM_LAYERS = 5
-    BATCH_SIZE = 4
+    # Larger batch when on GPU, smaller on CPU to keep memory usage reasonable
+    BATCH_SIZE = 8 if _DEVICE == "cuda" else 4
     EPOCHS = 200  # More epochs
     LEARNING_RATE = 3e-4  # Slightly lower
     WEIGHT_DECAY = 1e-5

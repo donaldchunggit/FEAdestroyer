@@ -12,3 +12,7 @@ __pycache__/
 # OS / editors
 .DS_Store
 .vscode/
+
+# Training datasets (regenerated via run_fresh.py)
+dataset/
+generator_adv/advanced_dataset/
