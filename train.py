@@ -87,33 +87,49 @@ class Config:
     EXPERIMENT_NAME = "advanced_professor_v1"
     SEED = 42
     DEVICE = _DEVICE
-    TRAIN_DIR = "generator_adv/advanced_dataset/train"
-    VAL_DIR = "generator_adv/advanced_dataset/val"
+    # Prefer real-FEM dataset; fall back to analytical if not generated yet
+    TRAIN_DIR = ("generator_fem/fem_dataset/train"
+                 if os.path.isdir("generator_fem/fem_dataset/train")
+                 else "generator_adv/advanced_dataset/train")
+    VAL_DIR   = ("generator_fem/fem_dataset/val"
+                 if os.path.isdir("generator_fem/fem_dataset/val")
+                 else "generator_adv/advanced_dataset/val")
     MAX_TRAIN_SAMPLES = None
     MAX_VAL_SAMPLES = None
     HIDDEN_DIM = 256
     NUM_LAYERS = 5
     # Larger batch when on GPU, smaller on CPU to keep memory usage reasonable
     BATCH_SIZE = 8 if _DEVICE == "cuda" else 4
-    EPOCHS = 200  # More epochs
-    LEARNING_RATE = 3e-4  # Slightly lower
+
+    # GPU gets full 200-epoch run; CPU gets a quick 50-epoch smoke-test run
+    if _DEVICE == "cuda":
+        EPOCHS = 1000
+        WARMUP_EPOCHS = 75
+        CURRICULUM_STAGES = [
+            {"name": "warmup",      "epochs":  75, "disp_weight": 0.1, "stress_weight": 0.0, "scale_weight": 1000.0, "corr_weight": 0.0},
+            {"name": "scale",       "epochs": 125, "disp_weight": 0.5, "stress_weight": 0.0, "scale_weight":  500.0, "corr_weight": 0.0},
+            {"name": "correlation", "epochs": 400, "disp_weight": 1.0, "stress_weight": 0.1, "scale_weight":  100.0, "corr_weight": 0.5},
+            {"name": "stress",      "epochs": 400, "disp_weight": 1.0, "stress_weight": 0.5, "scale_weight":   20.0, "corr_weight": 0.2},
+        ]
+    else:
+        EPOCHS = 200
+        WARMUP_EPOCHS = 15
+        CURRICULUM_STAGES = [
+            {"name": "warmup",      "epochs": 15, "disp_weight": 0.1, "stress_weight": 0.0, "scale_weight": 1000.0, "corr_weight": 0.0},
+            {"name": "scale",       "epochs": 25, "disp_weight": 0.5, "stress_weight": 0.0, "scale_weight":  500.0, "corr_weight": 0.0},
+            {"name": "correlation", "epochs": 80, "disp_weight": 1.0, "stress_weight": 0.1, "scale_weight":  100.0, "corr_weight": 0.5},
+            {"name": "stress",      "epochs": 80, "disp_weight": 1.0, "stress_weight": 0.5, "scale_weight":   20.0, "corr_weight": 0.2},
+        ]
+
+    LEARNING_RATE = 3e-4
     WEIGHT_DECAY = 1e-5
     GRAD_CLIP = 1.0
-    WARMUP_EPOCHS = 15  # Longer warmup
     YIELD_STRESS = 250e6
     MIN_SAFETY_FACTOR = 1.5
     HUBER_DELTA = 1e-3
     EMA_MOMENTUM = 0.9
     TARGET_DISP_ERROR = 10.0
     TARGET_STRESS_ERROR = 15.0
-
-    # Adjusted curriculum
-    CURRICULUM_STAGES = [
-        {"name": "warmup", "epochs": 15, "disp_weight": 0.1, "stress_weight": 0.0, "scale_weight": 1000.0, "corr_weight": 0.0},
-        {"name": "scale", "epochs": 25, "disp_weight": 0.5, "stress_weight": 0.0, "scale_weight": 500.0, "corr_weight": 0.0},
-        {"name": "correlation", "epochs": 80, "disp_weight": 1.0, "stress_weight": 0.1, "scale_weight": 100.0, "corr_weight": 0.5},
-        {"name": "stress", "epochs": 80, "disp_weight": 1.0, "stress_weight": 0.5, "scale_weight": 20.0, "corr_weight": 0.2},
-    ]
 
 config = Config()
 
@@ -380,6 +396,47 @@ class AdvancedTrainer:
         print("TRAINING COMPLETE")
         print(f"Best correlation achieved: {self.best_correlation:.3f}")
         print(f"Best model saved to: {self.best_model_path}")
+        print("="*80)
+        self._print_deployment_assessment()
+
+    def _print_deployment_assessment(self):
+        r = self.best_correlation
+        print("\n" + "="*80)
+        print("ENGINEERING DEPLOYMENT ASSESSMENT")
+        print("="*80)
+        print(f"  Pearson R (displacement): {r:.4f}\n")
+
+        if r >= 0.99:
+            status  = "DEPLOYMENT READY — PRODUCTION SURROGATE"
+            detail  = ("Model accuracy meets production FEA surrogate standards.\n"
+                       "  Suitable for: automated design loops, real-time load analysis,\n"
+                       "  digital twin integration, and replacing full FEA in iteration.")
+        elif r >= 0.95:
+            status  = "DEPLOYMENT READY — PRELIMINARY DESIGN"
+            detail  = ("Model accuracy meets preliminary engineering deployment standards.\n"
+                       "  Suitable for: design guidance, trend analysis, topology screening,\n"
+                       "  and load-path identification.\n"
+                       "  Requirement: final designs must be verified with full FEA.")
+        elif r >= 0.90:
+            status  = "LIMITED USE — SCREENING TOOL ONLY"
+            detail  = ("Model is below reliable deployment threshold.\n"
+                       "  Suitable for: rough feasibility checks and design space exploration.\n"
+                       "  Requirement: ALL results must be confirmed with full FEA before any\n"
+                       "  engineering decision. Do not use for sizing or safety calculations.")
+        else:
+            status  = "NOT DEPLOYABLE"
+            detail  = ("Model accuracy is insufficient for engineering use.\n"
+                       "  R < 0.90 means predictions cannot be trusted for any structural decision.\n"
+                       "  Actions: generate more training data, increase model depth/width,\n"
+                       "  extend training epochs, or review data quality.")
+
+        print(f"  STATUS: {status}")
+        print(f"\n  {detail}")
+        print("\n  Engineering R thresholds (displacement surrogate):")
+        print("    R >= 0.99  Production surrogate (replaces FEA in design loops)")
+        print("    R >= 0.95  Deployment ready    (preliminary design & trend analysis)")
+        print("    R >= 0.90  Screening only      (every result needs FEA validation)")
+        print("    R <  0.90  Not deployable      (results cannot be trusted)")
         print("="*80)
 
 def main():

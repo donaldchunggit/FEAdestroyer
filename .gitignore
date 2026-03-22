@@ -16,3 +16,4 @@ __pycache__/
 # Training datasets (regenerated via run_fresh.py)
 dataset/
 generator_adv/advanced_dataset/
+generator_fem/fem_dataset/
