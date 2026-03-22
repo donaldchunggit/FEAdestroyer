@@ -1,435 +1,378 @@
 #!/usr/bin/env python3
-"""
-Working training script for 3D Solid PINN GNN.
+"""Main FEA Destroyer training script.
+
+Uses EngineeringGNN with curriculum learning and correlation-based model selection.
 Run: python train.py
 """
-
-import os
-import sys
-import time
+import os, sys, torch, warnings, math
+import torch.nn.functional as F
+import numpy as np
 from datetime import datetime
 from pathlib import Path
-
-import torch
-import torch.nn as nn
-from torch_geometric.loader import DataLoader
-import numpy as np
 from tqdm import tqdm
+from collections import deque
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import global_mean_pool
 
-print("="*60)
-print("FEA GNN TRAINING")
-print("="*60)
-
-# Add current directory to path
+warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Try imports with helpful messages
-print("\nChecking imports...")
 try:
-    from models.solid_gnn import SimpleSolidGNN
-    print("✓ Model imported")
+    from models.engineering_gnn import EngineeringGNN
+    print("✓ Engineering GNN imported")
 except ImportError as e:
-    print(f"✗ Model import failed: {e}")
-    print("  Creating simple model...")
-    
-    # Create a simple model inline
-    import torch.nn.functional as F
-    from torch_geometric.nn import GINEConv
-    
-    class SimpleSolidGNN(nn.Module):
-        def __init__(self, node_dim=5, edge_dim=6, hidden_dim=128, num_layers=3):
-            super().__init__()
-            
-            # Node encoder
-            self.node_enc = nn.Sequential(
-                nn.Linear(node_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim)
-            )
-            
-            # Edge encoder
-            self.edge_enc = nn.Sequential(
-                nn.Linear(edge_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim)
-            )
-            
-            # GNN layers
-            self.convs = nn.ModuleList()
-            for _ in range(num_layers):
-                mlp = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.ReLU(),
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim)
-                )
-                self.convs.append(GINEConv(nn=mlp, edge_dim=hidden_dim))
-            
-            # Output heads
-            self.head_u = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.ReLU(),
-                nn.Linear(hidden_dim // 2, 3)  # 3D displacement
-            )
-            
-            self.head_stress = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.ReLU(),
-                nn.Linear(hidden_dim // 2, 1)  # Stress
-            )
-        
-        def forward(self, data):
-            # Encode
-            x = self.node_enc(data.x)
-            edge_attr = self.edge_enc(data.edge_attr)
-            
-            # Message passing
-            for conv in self.convs:
-                x = conv(x, data.edge_index, edge_attr)
-                x = F.relu(x)
-            
-            # Predict
-            displacement = self.head_u(x)
-            stress = self.head_stress(x)
-            
-            return {
-                'displacement': displacement,
-                'stress': stress
-            }
-
-try:
-    from utils.data_loader import load_npz_dataset
-    print("✓ Data loader imported")
-except ImportError as e:
-    print(f"✗ Data loader import failed: {e}")
-    print("  Creating simple data loader...")
-    
-    # Create simple data loader
-    import glob
-    def load_npz_dataset(npz_dir, max_samples=None):
-        print(f"Loading from {npz_dir}...")
-        files = glob.glob(os.path.join(npz_dir, "*.npz"))
-        if max_samples:
-            files = files[:max_samples]
-        
-        data_list = []
-        for file in files[:5]:  # Load only 5 for testing
-            try:
-                import numpy as np
-                from torch_geometric.data import Data
-                
-                data_np = np.load(file)
-                pos = torch.tensor(data_np['node_coords'], dtype=torch.float32)
-                x = torch.ones(len(pos), 5, dtype=torch.float32)
-                
-                # Simple edge creation
-                edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long).t()
-                edge_attr = torch.ones(2, 6, dtype=torch.float32)
-                
-                data = Data(
-                    x=x,
-                    pos=pos,
-                    edge_index=edge_index,
-                    edge_attr=edge_attr,
-                    u_true=torch.tensor(data_np['node_disp'], dtype=torch.float32),
-                    stress_true=torch.tensor(data_np['node_stresses'], dtype=torch.float32),
-                    num_nodes=len(pos)
-                )
-                data_list.append(data)
-            except:
-                continue
-        
-        return data_list
-
-try:
-    from utils.visualization import plot_training_history
-    print("✓ Visualization imported")
-except ImportError:
-    print("⚠ Visualization not available, will save as text")
-    def plot_training_history(history, save_path=None):
-        if save_path:
-            txt_path = str(save_path).replace('.png', '.txt')
-            with open(txt_path, 'w') as f:
-                if 'train_loss' in history:
-                    for i, loss in enumerate(history['train_loss']):
-                        f.write(f"Epoch {i+1} train: {loss:.6f}\n")
-                if 'val_loss' in history:
-                    for i, loss in enumerate(history['val_loss']):
-                        f.write(f"Epoch {i+1} val: {loss:.6f}\n")
-            print(f"History saved to {txt_path}")
-
-# Configuration with all required keys
-config = {
-    'experiment_name': 'fea_gnn_run',
-    'seed': 42,
-    'device': 'cpu',
-    'data': {
-        'train_dir': 'dataset/train',
-        'val_dir': 'dataset/val',
-        'max_train_samples': 80,
-        'max_val_samples': 20,
-        'batch_size': 2
-    },
-    'model': {
-        'hidden_dim': 128,
-        'num_layers': 3
-        # No dropout parameter for SimpleSolidGNN
-    },
-    'training': {
-        'epochs': 10,
-        'learning_rate': 0.001,
-        'weight_decay': 0.0001,
-        'gradient_clip': 1.0,
-        'checkpoint_freq': 5,
-        'patience': 5
-    },
-    'loss': {
-        'physics_weight': 1.0,
-        'data_weight': 1.0,
-        'boundary_weight': 10.0
-    }
-}
-
-print(f"\nUsing configuration:")
-print(f"  Device: {config['device']}")
-print(f"  Train dir: {config['data']['train_dir']}")
-print(f"  Epochs: {config['training']['epochs']}")
-
-# Set random seeds
-torch.manual_seed(config['seed'])
-np.random.seed(config['seed'])
-
-# Create experiment directory
-timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-exp_dir = Path(f"experiments/{config['experiment_name']}_{timestamp}")
-exp_dir.mkdir(parents=True, exist_ok=True)
-print(f"\nExperiment directory: {exp_dir}")
-
-# Save config
-with open(exp_dir / 'config.txt', 'w') as f:
-    for key, value in config.items():
-        if isinstance(value, dict):
-            f.write(f"{key}:\n")
-            for k2, v2 in value.items():
-                f.write(f"  {k2}: {v2}\n")
-        else:
-            f.write(f"{key}: {value}\n")
-
-# Load data
-print("\n" + "="*60)
-print("Loading dataset...")
-print("="*60)
-
-# Check if dataset exists
-if not os.path.exists(config['data']['train_dir']):
-    print(f"✗ Training directory not found: {config['data']['train_dir']}")
-    print("  Please generate data first or check the path")
+    print(f"✗ Import failed: {e}")
     sys.exit(1)
 
-train_data = load_npz_dataset(
-    config['data']['train_dir'],
-    max_samples=config['data']['max_train_samples']
-)
+from utils.data_loader import load_npz_dataset
 
-if os.path.exists(config['data']['val_dir']):
-    val_data = load_npz_dataset(
-        config['data']['val_dir'],
-        max_samples=config['data']['max_val_samples']
-    )
-else:
-    print(f"⚠ Validation directory not found, using training data for validation")
-    val_data = train_data[:min(5, len(train_data))]
+class Config:
+    EXPERIMENT_NAME = "advanced_professor_v1"
+    SEED = 42
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    TRAIN_DIR = "generator_adv/advanced_dataset/train"
+    VAL_DIR = "generator_adv/advanced_dataset/val"
+    MAX_TRAIN_SAMPLES = None
+    MAX_VAL_SAMPLES = None
+    HIDDEN_DIM = 256
+    NUM_LAYERS = 5
+    BATCH_SIZE = 4
+    EPOCHS = 200  # More epochs
+    LEARNING_RATE = 3e-4  # Slightly lower
+    WEIGHT_DECAY = 1e-5
+    GRAD_CLIP = 1.0
+    WARMUP_EPOCHS = 15  # Longer warmup
+    YIELD_STRESS = 250e6
+    MIN_SAFETY_FACTOR = 1.5
+    HUBER_DELTA = 1e-3
+    EMA_MOMENTUM = 0.9
+    TARGET_DISP_ERROR = 10.0
+    TARGET_STRESS_ERROR = 15.0
 
-print(f"Train samples: {len(train_data)}")
-print(f"Val samples: {len(val_data)}")
+    # Adjusted curriculum
+    CURRICULUM_STAGES = [
+        {"name": "warmup", "epochs": 15, "disp_weight": 0.1, "stress_weight": 0.0, "scale_weight": 1000.0, "corr_weight": 0.0},
+        {"name": "scale", "epochs": 25, "disp_weight": 0.5, "stress_weight": 0.0, "scale_weight": 500.0, "corr_weight": 0.0},
+        {"name": "correlation", "epochs": 80, "disp_weight": 1.0, "stress_weight": 0.1, "scale_weight": 100.0, "corr_weight": 0.5},
+        {"name": "stress", "epochs": 80, "disp_weight": 1.0, "stress_weight": 0.5, "scale_weight": 20.0, "corr_weight": 0.2},
+    ]
 
-if len(train_data) == 0:
-    print("✗ No training data loaded!")
-    sys.exit(1)
+config = Config()
 
-# Create data loaders
-train_loader = DataLoader(
-    train_data,
-    batch_size=config['data']['batch_size'],
-    shuffle=True,
-    num_workers=0
-)
+def safe_log(x, eps=1e-12):
+    return torch.log(torch.clamp(x, min=eps))
 
-val_loader = DataLoader(
-    val_data,
-    batch_size=config['data']['batch_size'],
-    shuffle=False,
-    num_workers=0
-)
+def get_free_mask(batch):
+    if hasattr(batch, "free_mask") and batch.free_mask is not None:
+        return batch.free_mask.float()
+    if hasattr(batch, "fixed_mask") and batch.fixed_mask is not None:
+        return (1.0 - batch.fixed_mask.float())
+    return None
 
-# Create model - WITHOUT DROPOUT parameter
-sample = train_data[0]
-print(f"\nSample info:")
-print(f"  Node features: {sample.x.shape[1]}")
-print(f"  Edge features: {sample.edge_attr.shape[1]}")
+def get_curriculum_phase(epoch, stages):
+    cumulative_epochs = 0
+    for stage in stages:
+        if epoch <= cumulative_epochs + stage["epochs"]:
+            return stage
+        cumulative_epochs += stage["epochs"]
+    return stages[-1]
 
-model = SimpleSolidGNN(
-    node_dim=sample.x.shape[1],
-    edge_dim=sample.edge_attr.shape[1],
-    hidden_dim=config['model']['hidden_dim'],
-    num_layers=config['model']['num_layers']
-    # No dropout parameter!
-)
-
-device = torch.device(config['device'])
-model = model.to(device)
-
-# Optimizer
-optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr=config['training']['learning_rate'],
-    weight_decay=config['training']['weight_decay']
-)
-
-# Simple scheduler
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
-
-# Print model info
-total_params = sum(p.numel() for p in model.parameters())
-print(f"\nModel parameters: {total_params:,}")
-
-# Training variables
-best_val_loss = float('inf')
-history = {'train_loss': [], 'val_loss': []}
-
-print("\n" + "="*60)
-print("STARTING TRAINING")
-print("="*60)
-
-start_time = time.time()
-
-# Training loop
-for epoch in range(1, config['training']['epochs'] + 1):
-    print(f"\nEpoch {epoch}/{config['training']['epochs']}")
+def correlation_loss(u_pred, u_true, mask=None):
+    """Improved correlation loss that's bounded and stable"""
+    if mask is not None:
+        u_pred = u_pred[mask]
+        u_true = u_true[mask]
     
-    # Training
-    model.train()
-    train_losses = []
+    if u_pred.numel() == 0:
+        return torch.tensor(0.0, device=u_pred.device)
     
-    pbar = tqdm(train_loader, desc="Training", leave=False)
-    for batch in pbar:
-        batch = batch.to(device)
-        
-        # Forward pass
-        outputs = model(batch)
-        
-        # Simple loss: MSE between prediction and ground truth
-        loss = nn.functional.mse_loss(outputs['displacement'], batch.u_true)
-        
-        # Add stress loss if available
-        if hasattr(batch, 'stress_true'):
-            loss += 0.5 * nn.functional.mse_loss(outputs['stress'].squeeze(), batch.stress_true.squeeze())
-        
-        # Boundary condition loss
-        if hasattr(batch, 'bc'):
-            loss += 10.0 * torch.mean((outputs['displacement'] * batch.bc) ** 2)
-        
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        
-        # Gradient clipping
-        if config['training']['gradient_clip'] > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config['training']['gradient_clip'])
-        
-        optimizer.step()
-        
-        train_losses.append(loss.item())
-        pbar.set_postfix({'loss': loss.item()})
+    # Normalize predictions and targets to have zero mean and unit variance
+    u_pred_norm = (u_pred - u_pred.mean(dim=0, keepdim=True)) / (u_pred.std(dim=0, keepdim=True) + 1e-8)
+    u_true_norm = (u_true - u_true.mean(dim=0, keepdim=True)) / (u_true.std(dim=0, keepdim=True) + 1e-8)
     
-    avg_train_loss = np.mean(train_losses)
-    history['train_loss'].append(avg_train_loss)
+    # FIXED: Better correlation loss - use MSE on normalized values
+    # This encourages correlation without the numerical issues of 1-corr
+    loss = F.mse_loss(u_pred_norm, u_true_norm)
     
-    # Validation
-    model.eval()
-    val_losses = []
+    return loss
+
+class AdvancedTrainer:
+    def __init__(self, model, config, device):
+        self.model, self.config, self.device = model, config, device
+        
+        # Create separate optimizer with higher LR for scale parameters
+        scale_params = []
+        other_params = []
+        for name, param in model.named_parameters():
+            if 'log_base_disp_scale' in name or 'scale' in name.lower():
+                scale_params.append(param)
+            else:
+                other_params.append(param)
+        
+        self.optimizer = torch.optim.AdamW([
+            {'params': other_params, 'lr': config.LEARNING_RATE},
+            {'params': scale_params, 'lr': config.LEARNING_RATE * 3.0},  # Reduced from 5x
+        ], weight_decay=config.WEIGHT_DECAY)
+        
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=10
+        )
+        
+        self.history = {"train_loss": [], "val_loss": [], "correlation": []}
+        self.best_correlation = -float("inf")
+        self.best_model_path = "best_model_correlation.pt"
+
+    def train_epoch(self, loader, phase):
+        self.model.train()
+        total_loss, num_batches = 0.0, 0
+        pbar = tqdm(loader, desc=f"Phase: {phase['name']}", leave=False)
+
+        for batch in pbar:
+            batch = batch.to(self.device)
+            out = self.model(batch)
+            u_pred, u_true = out["displacement"], batch.u_true
+            free_mask = get_free_mask(batch)
+            bidx = getattr(batch, "batch", torch.zeros(u_true.size(0), dtype=torch.long, device=self.device))
+            
+            # Apply mask for displacement
+            if free_mask is not None:
+                m = free_mask.squeeze(-1) > 0.5
+                u_pred_masked = u_pred[m]
+                u_true_masked = u_true[m]
+                bidx_masked = bidx[m]
+                raw_masked = out["raw_displacement"][m]
+            else:
+                u_pred_masked = u_pred
+                u_true_masked = u_true
+                bidx_masked = bidx
+                raw_masked = out["raw_displacement"]
+            
+            # 1. Displacement loss (Huber for robustness)
+            loss_u = F.huber_loss(u_pred_masked, u_true_masked, delta=self.config.HUBER_DELTA)
+            
+            # 2. Scale supervision
+            if u_true_masked.numel() > 0:
+                gt_rms = global_mean_pool((u_true_masked**2).sum(-1, keepdim=True), bidx_masked).sqrt()
+                raw_rms = global_mean_pool((raw_masked**2).sum(-1, keepdim=True), bidx_masked).sqrt().clamp(min=1e-8)
+                scale_target = (gt_rms / raw_rms).squeeze()
+                
+                # Handle shape mismatches
+                if scale_target.dim() == 0:
+                    scale_target = scale_target.unsqueeze(0)
+                if out["disp_scale_graph"].dim() == 0:
+                    disp_scale = out["disp_scale_graph"].unsqueeze(0)
+                else:
+                    disp_scale = out["disp_scale_graph"]
+                
+                # Use log scale for better gradient flow
+                loss_scale = F.mse_loss(safe_log(disp_scale), safe_log(scale_target))
+            else:
+                loss_scale = torch.tensor(0.0, device=self.device)
+            
+            # 3. FIXED: Better correlation loss
+            loss_corr = correlation_loss(u_pred_masked, u_true_masked)
+            
+            # 4. Stress loss (if applicable)
+            loss_stress = torch.tensor(0.0, device=self.device)
+            if phase["stress_weight"] > 0 and hasattr(batch, "stress_true"):
+                if free_mask is not None:
+                    stress_pred = out["stress"][m]
+                    stress_true = batch.stress_true[m]
+                else:
+                    stress_pred = out["stress"]
+                    stress_true = batch.stress_true
+                
+                if stress_pred.numel() > 0:
+                    loss_stress = F.mse_loss(safe_log(stress_pred + 1.0), safe_log(stress_true + 1.0))
+            
+            # Combined loss with phase weights
+            total = (phase["disp_weight"] * loss_u + 
+                    phase["scale_weight"] * loss_scale + 
+                    phase.get("corr_weight", 0.0) * loss_corr +
+                    phase["stress_weight"] * loss_stress)
+            
+            self.optimizer.zero_grad()
+            total.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.GRAD_CLIP)
+            self.optimizer.step()
+            
+            total_loss += total.item()
+            num_batches += 1
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'loss': f'{total.item():.4f}',
+                'corr_loss': f'{loss_corr.item():.3f}',
+                'scale': f'{out["disp_scale"].item():.6f}'
+            })
+            
+        return total_loss / max(num_batches, 1)
+
+    @torch.no_grad()
+    def validate(self, loader):
+        """Validation focused on correlation"""
+        self.model.eval()
+        
+        all_u_true = []
+        all_u_pred = []
+        val_losses = []
+        
+        for batch in loader:
+            batch = batch.to(self.device)
+            out = self.model(batch)
+            
+            u_true = batch.u_true
+            u_pred = out["displacement"]
+            free_mask = get_free_mask(batch)
+            
+            # Apply mask
+            if free_mask is not None:
+                m = free_mask.squeeze(-1) > 0.5
+                u_true_masked = u_true[m]
+                u_pred_masked = u_pred[m]
+            else:
+                u_true_masked = u_true
+                u_pred_masked = u_pred
+            
+            if u_pred_masked.numel() > 0:
+                val_losses.append(F.mse_loss(u_pred_masked, u_true_masked).item())
+                
+                # Store for correlation calculation
+                all_u_true.append(u_true_masked.cpu().numpy())
+                all_u_pred.append(u_pred_masked.cpu().numpy())
+        
+        if not all_u_true:
+            return {"mse": 0.0, "correlation": 0.0, "mae_mm": 0.0}
+        
+        # Concatenate all data
+        u_true = np.concatenate(all_u_true, axis=0)
+        u_pred = np.concatenate(all_u_pred, axis=0)
+        
+        # Compute metrics
+        mse = np.mean((u_pred - u_true)**2)
+        mae_mm = np.mean(np.abs(u_pred - u_true)) * 1000.0
+        
+        # FIXED: Better correlation calculation
+        # Reshape to combine all dimensions for a single correlation metric
+        u_true_flat = u_true.flatten()
+        u_pred_flat = u_pred.flatten()
+        
+        # Compute Pearson correlation
+        corr_matrix = np.corrcoef(u_true_flat, u_pred_flat)
+        correlation = corr_matrix[0, 1] if not np.isnan(corr_matrix[0, 1]) else 0.0
+        
+        return {
+            "mse": float(np.mean(val_losses)) if val_losses else 0.0,
+            "correlation": correlation,
+            "mae_mm": mae_mm,
+            "true_mean_mm": np.mean(np.abs(u_true)) * 1000.0,
+            "pred_mean_mm": np.mean(np.abs(u_pred)) * 1000.0,
+        }
+
+    def train(self, train_loader, val_loader):
+        print("\n" + "="*80)
+        print("FEA DESTROYER — TRAINING")
+        print("="*80)
+        
+        for epoch in range(1, self.config.EPOCHS + 1):
+            phase = get_curriculum_phase(epoch, self.config.CURRICULUM_STAGES)
+            
+            # Train
+            train_loss = self.train_epoch(train_loader, phase)
+            
+            # Validate
+            stats = self.validate(val_loader)
+            
+            # Update learning rate
+            self.scheduler.step(stats["mse"])
+            
+            # Get current learning rate
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            
+            print(f"\nEpoch {epoch:3d} [{phase['name']}] LR: {current_lr:.2e}")
+            print(f"  Train Loss: {train_loss:.4f}")
+            print(f"  True mean:  {stats['true_mean_mm']:.3f}mm")
+            print(f"  Pred mean:  {stats['pred_mean_mm']:.3f}mm")
+            print(f"  MAE:        {stats['mae_mm']:.3f}mm")
+            print(f"  Correlation: {stats['correlation']:.3f}")
+            
+            # Track best model by correlation
+            if stats['correlation'] > self.best_correlation:
+                self.best_correlation = stats['correlation']
+                print(f"  ✓ NEW BEST CORRELATION: {stats['correlation']:.3f}")
+                
+                # Save best model
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'correlation': stats['correlation'],
+                    'mae_mm': stats['mae_mm'],
+                    'config': {k: v for k, v in vars(self.config).items() if not k.startswith('_')}
+                }, self.best_model_path)
+            
+            # Early stopping if correlation is good enough
+            if stats['correlation'] > 0.7:  # Slightly lower threshold
+                print(f"\n🎉 Achieved good correlation! Stopping early.")
+                break
+        
+        print("\n" + "="*80)
+        print("TRAINING COMPLETE")
+        print(f"Best correlation achieved: {self.best_correlation:.3f}")
+        print(f"Best model saved to: {self.best_model_path}")
+        print("="*80)
+
+def main():
+    # Set seed for reproducibility
+    torch.manual_seed(config.SEED)
+    np.random.seed(config.SEED)
     
+    device = torch.device(config.DEVICE)
+    
+    print("Loading datasets...")
+    train_data = load_npz_dataset(config.TRAIN_DIR, max_samples=config.MAX_TRAIN_SAMPLES)
+    val_data = load_npz_dataset(config.VAL_DIR, max_samples=config.MAX_VAL_SAMPLES)
+    
+    print(f"Train: {len(train_data)} samples, Val: {len(val_data)} samples")
+    
+    _pin = (config.DEVICE == "cuda")
+    train_loader = DataLoader(train_data, batch_size=config.BATCH_SIZE, shuffle=True, pin_memory=_pin)
+    val_loader = DataLoader(val_data, batch_size=config.BATCH_SIZE, pin_memory=_pin)
+    
+    sample = train_data[0]
+    model = EngineeringGNN(
+        node_dim=sample.x.shape[1], 
+        edge_dim=sample.edge_attr.shape[1],
+        hidden_dim=config.HIDDEN_DIM,
+        num_layers=config.NUM_LAYERS
+    ).to(device)
+    
+    # Initialize scale based on data statistics
     with torch.no_grad():
-        for batch in val_loader:
+        # Compute average scale from a few batches
+        scales = []
+        for i, batch in enumerate(train_loader):
+            if i >= 5: break
             batch = batch.to(device)
-            outputs = model(batch)
-            loss = nn.functional.mse_loss(outputs['displacement'], batch.u_true)
-            
-            if hasattr(batch, 'stress_true'):
-                loss += 0.5 * nn.functional.mse_loss(outputs['stress'].squeeze(), batch.stress_true.squeeze())
-            
-            if hasattr(batch, 'bc'):
-                loss += 10.0 * torch.mean((outputs['displacement'] * batch.bc) ** 2)
-            
-            val_losses.append(loss.item())
+            u_true = batch.u_true
+            free_mask = get_free_mask(batch)
+            if free_mask is not None:
+                u_true = u_true[free_mask.squeeze(-1) > 0.5]
+            if u_true.numel() > 0:
+                scales.append(u_true.abs().mean().item())
+        
+        if scales:
+            init_scale = np.mean(scales)
+            model.log_base_disp_scale.fill_(np.log(max(init_scale, 1e-6)))
+            print(f"Initialized scale from data: {init_scale:.6f}")
     
-    avg_val_loss = np.mean(val_losses)
-    history['val_loss'].append(avg_val_loss)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"Initial scale: {torch.exp(model.log_base_disp_scale).item():.6f}")
     
-    # Update scheduler
-    scheduler.step()
-    
-    print(f"Train Loss: {avg_train_loss:.6f}")
-    print(f"Val Loss: {avg_val_loss:.6f}")
-    print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.2e}")
-    
-    # Save checkpoint
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'train_loss': avg_train_loss,
-            'val_loss': avg_val_loss,
-            'config': config
-        }, exp_dir / 'best_model.pt')
-        print(f"  ✓ Saved best model (loss: {best_val_loss:.6f})")
-    
-    if epoch % config['training']['checkpoint_freq'] == 0:
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-        }, exp_dir / f'checkpoint_epoch_{epoch}.pt')
-        print(f"  ✓ Checkpoint saved")
-    
-    # Early stopping
-    if epoch > config['training']['patience']:
-        recent_losses = history['val_loss'][-config['training']['patience']:]
-        if min(recent_losses) > best_val_loss:
-            print(f"\nEarly stopping at epoch {epoch}")
-            break
+    trainer = AdvancedTrainer(model, config, device)
+    trainer.train(train_loader, val_loader)
 
-# Training complete
-training_time = time.time() - start_time
-print(f"\n" + "="*60)
-print(f"TRAINING COMPLETE!")
-print(f"Time: {training_time:.1f} seconds")
-print(f"Best validation loss: {best_val_loss:.6f}")
-print(f"Models saved in: {exp_dir}")
-print("="*60)
-
-# Plot/save training history
-plot_training_history(history, save_path=exp_dir / 'training_history.png')
-
-# Save history as numpy file
-np.save(exp_dir / 'history.npy', history)
-
-# Test on one sample
-print("\nTesting on one sample...")
-model.eval()
-test_sample = val_data[0].to(device)
-with torch.no_grad():
-    outputs = model(test_sample)
-    test_loss = nn.functional.mse_loss(outputs['displacement'], test_sample.u_true).item()
-print(f"Test loss: {test_loss:.6f}")
-
-print(f"\n" + "="*60)
-print("NEXT STEPS:")
-print(f"1. View training history: {exp_dir}/training_history.txt")
-print(f"2. Use best model: {exp_dir}/best_model.pt")
-print(f"3. Run predictions: python predict.py --model {exp_dir}/best_model.pt --input dataset/val/sample_0000.npz")
-print("="*60)
+if __name__ == "__main__":
+    main()

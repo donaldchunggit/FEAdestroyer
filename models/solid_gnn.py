@@ -88,14 +88,13 @@ class SolidPINN_GNN(nn.Module):
         # Encode nodes and edges
         x = self.node_encoder(data.x)
         edge_attr = self.edge_encoder(data.edge_attr)
-        
-        # Message passing with residual connections
+
+        # Message passing with pre-norm residual connections
         for conv, norm in zip(self.convs, self.norms):
             x_res = x
-            x = conv(x, data.edge_index, edge_attr)
-            x = norm(x)
-            x = F.gelu(x)
-            x = x_res + x  # Residual connection
+            x = norm(x)                              # Normalize before conv (pre-norm)
+            x = conv(x, data.edge_index, edge_attr)  # Conv MLP already ends with GELU
+            x = x_res + x                            # Residual (no extra activation needed)
         
         # Predict outputs
         displacement = self.displacement_head(x)
@@ -156,11 +155,10 @@ class SimpleSolidGNN(nn.Module):
         # Encode
         x = self.node_enc(data.x)
         edge_attr = self.edge_enc(data.edge_attr)
-        
-        # Message passing
+
+        # Message passing with residual connections
         for conv in self.convs:
-            x = conv(x, data.edge_index, edge_attr)
-            x = F.relu(x)
+            x = F.relu(conv(x, data.edge_index, edge_attr)) + x
         
         # Predict
         displacement = self.head_u(x)

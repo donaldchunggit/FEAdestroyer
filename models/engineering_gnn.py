@@ -60,6 +60,7 @@ class EngineeringGNN(nn.Module):
         for _ in range(num_layers):
             mlp = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
                 nn.ReLU(),
                 nn.Linear(hidden_dim, hidden_dim),
             )
@@ -165,7 +166,7 @@ class EngineeringGNN(nn.Module):
         edge_attr = self.edge_enc(data.edge_attr)
         for conv, norm in zip(self.convs, self.post_norms):
             h = conv(x, data.edge_index, edge_attr)
-            x = norm(x + F.relu(h))
+            x = F.relu(norm(x + h))  # Normalize before activation to preserve sign in residual
 
         raw_u = self.disp_head(x)
         batch = self._get_batch(data, raw_u.size(0), raw_u.device)

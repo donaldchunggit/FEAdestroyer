@@ -65,20 +65,21 @@ def _build_edges_from_tets(tets: np.ndarray) -> np.ndarray:
     tets: [T,4] int
     returns directed edge_index as np array [2, E]
     """
-    # Each tet has 6 undirected edges; we add both directions.
-    # Use python set to dedupe.
-    edges = set()
-    for a, b, c, d in tets:
-        pairs = [(a, b), (a, c), (a, d), (b, c), (b, d), (c, d)]
-        for i, j in pairs:
-            edges.add((int(i), int(j)))
-            edges.add((int(j), int(i)))
-
-    if len(edges) == 0:
+    if tets.shape[0] == 0:
         return np.zeros((2, 0), dtype=np.int64)
 
-    edge_index = np.array(list(edges), dtype=np.int64).T  # [2, E]
-    return edge_index
+    # All 6 undirected pairs per tet, vectorized over all tets at once
+    pair_idx = np.array([[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]], dtype=np.int64)
+    src = tets[:, pair_idx[:, 0]].ravel()  # [T*6]
+    dst = tets[:, pair_idx[:, 1]].ravel()  # [T*6]
+
+    # Both directions
+    all_src = np.concatenate([src, dst])
+    all_dst = np.concatenate([dst, src])
+
+    # Deduplicate with numpy (much faster than a Python set for large meshes)
+    edge_index = np.unique(np.stack([all_src, all_dst], axis=1), axis=0).T  # [2, E]
+    return edge_index.astype(np.int64)
 
 
 # -----------------------------
@@ -190,7 +191,7 @@ def load_single_npz(npz_path: str) -> Data:
 
     # --- Build Data
     pyg = Data(
-        x=torch.from_numpy(x).float(),                    # [N,11]
+        x=torch.from_numpy(x).float(),                    # [N,12]
         pos=pos_t,                                        # [N,3]
         edge_index=edge_index_t,                           # [2,E]
         edge_attr=edge_attr,                               # [E,6]

@@ -97,7 +97,11 @@ class PhysicsLossCalculator:
         
         if hasattr(batch, 'stress_true') and batch.stress_true is not None:
             stress_pred = outputs['stress']
-            losses['stress'] = F.mse_loss(stress_pred, batch.stress_true)
+            # Log-space MSE is far more stable: stress spans many orders of magnitude
+            losses['stress'] = F.mse_loss(
+                torch.log(stress_pred + 1.0),
+                torch.log(batch.stress_true.clamp(min=0.0) + 1.0)
+            )
         
         return losses
     
@@ -125,9 +129,6 @@ class PhysicsLossCalculator:
             'stress': self.data_weight * 0.5
         }
         
-        total_loss = torch.tensor(0.0, device=batch.x.device)
-        for key, loss_val in losses.items():
-            weight = weights.get(key, 1.0)
-            total_loss = total_loss + weight * loss_val
+        total_loss = sum(weights.get(key, 1.0) * loss_val for key, loss_val in losses.items())
         
         return total_loss, losses
