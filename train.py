@@ -96,10 +96,10 @@ class Config:
                  else "generator_adv/advanced_dataset/val")
     MAX_TRAIN_SAMPLES = None
     MAX_VAL_SAMPLES = None
-    HIDDEN_DIM = 256
-    NUM_LAYERS = 5
+    HIDDEN_DIM = 512
+    NUM_LAYERS = 8
     # Larger batch when on GPU, smaller on CPU to keep memory usage reasonable
-    BATCH_SIZE = 8 if _DEVICE == "cuda" else 4
+    BATCH_SIZE = 64 if _DEVICE == "cuda" else 4
 
     # GPU gets full 200-epoch run; CPU gets a quick 50-epoch smoke-test run
     if _DEVICE == "cuda":
@@ -121,7 +121,7 @@ class Config:
             {"name": "stress",      "epochs": 80, "disp_weight": 1.0, "stress_weight": 0.5, "scale_weight":   20.0, "corr_weight": 0.2},
         ]
 
-    LEARNING_RATE = 3e-4
+    LEARNING_RATE = 5e-5
     WEIGHT_DECAY = 1e-5
     GRAD_CLIP = 1.0
     YIELD_STRESS = 250e6

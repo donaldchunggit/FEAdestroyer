@@ -45,22 +45,13 @@ def generate_dataset(num_samples: int, generator: str):
     print(f"Device: {device} — generating {num_samples} samples "
           f"({'FEM' if generator == 'fem' else 'analytical'} generator)\n")
 
-    if generator == "fem":
-        output_dir = "generator_fem/fem_dataset"
-        code = (
-            "import sys; sys.path.insert(0, 'generator_fem'); "
-            f"from fem_generator import generate_fem_dataset; "
-            f"generate_fem_dataset(num_samples={num_samples}, output_dir='{output_dir}')"
-        )
-    else:
-        output_dir = "generator_adv/advanced_dataset"
-        code = (
-            "import sys; sys.path.insert(0, 'generator_adv'); "
-            f"from adv_generator import generate_advanced_dataset; "
-            f"generate_advanced_dataset(num_samples={num_samples}, output_dir='{output_dir}')"
-        )
-
-    subprocess.run([sys.executable, "-c", code], check=True)
+    root = Path(__file__).resolve().parent
+    subprocess.run(
+        [sys.executable, str(root / "generate.py"),
+         "--generator", generator,
+         "--samples", str(num_samples)],
+        check=True,
+    )
     print()
 
 
